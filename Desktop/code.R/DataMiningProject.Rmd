@@ -1,0 +1,338 @@
+
+```{r library,message = FALSE, warning = FALSE} 
+library(readxl) 
+library(stringr) 
+library(ggplot2) 
+library(dplyr) 
+library(MASS) 
+library(glmnet) 
+library(ROCR) 
+library(tree) 
+library(maptree) 
+library(randomForest) 
+library(gbm)
+``` 
+ 
+```{r load_dataset}
+original<-read_excel("/Users/blakeshaw/Documents/Study/PSTAT131_F17/Final project/Arrests.xlsx", sheet = "Original Dataset") 
+arrest<-read_excel("/Users/blakeshaw/Documents/Study/PSTAT131_F17/Final project/Arrests.xlsx", sheet = "Final_dataset") 
+
+#changing time to numerical values between 0 and 24 hrs
+arrest$gametime_local <- str_split_fixed(arrest$gametime_local, " ", 2)[,2] arrest$gametime_local<-as.integer(str_split_fixed(arrest$gametime_local, ":", 3)[,1])+as.integer(str_split_fixed(arrest$gametime_local, ":", 3)[,2])/60 
+
+#adjusting variables types
+arrest$season<-as.factor(arrest$season) 
+arrest$day_of_wk<-as.factor(arrest$day_of_wk) 
+arrest$home_team<-as.factor(arrest$home_team) 
+arrest$away_team<-as.factor(arrest$away_team) 
+arrest$Winner_game<-as.factor(arrest$Winner_game) 
+arrest$OT<-as.factor(arrest$OT) 
+arrest$Arrests<-as.factor(arrest$Arrests) 
+arrest$division_gm<-as.factor(arrest$division_gm) 
+arrest$Narrow_loss<-as.factor(arrest$Narrow_loss) str(arrest) 
+``` 
+ 
+```{r EDA}
+plot(arrest$Arrests, xlab = "Arrest", ylab = "Count", main = "Arrest vs Count") 
+## There are fewer arrests at home. 
+ 
+# week_num (Numeric) 
+ggplot(arrest, aes(week_num,fill = Arrests)) + geom_histogram(position = "dodge", binwidth = 1) + ggtitle("Week_num vs Arrests") 
+## Although the number of "arrest = 0" is greater than "arrest = 1" in general, but we could see arrests occur more at the beginning and ending of a season. 
+
+table(arrest$week_num) 
+## There are fewer games during the middle of a season 
+ 
+# gametime_local (Numeric) 
+ggplot(arrest, aes(gametime_local,fill = Arrests)) + geom_histogram(position = "dodge", binwidth = 1) + ggtitle("Figure 1: Gametime_local vs Arrests") 
+## there are more arrests at night, and fewer arrests during noon. 
+ 
+ 
+ 
+ 
+ 
+# Difference (Numeric),Stadium_Capacity (Numeric), and gametime_local (Numeric) 
+statistics_table <- matrix(c(min(arrest$gametime_local),median(arrest$gametime_local), max(arrest$gametime_local),min(arrest$Difference),median(arrest$Difference),max(arrest$Diffe rence),min(arrest$Stadium_Capacity),median(arrest$Stadium_Capacity),max(arrest$Stadium_Capacity)), byrow = TRUE, ncol = 3) 
+statistics_table <- as.data.frame(round(statistics_table, digits = 2))
+colnames(statistics_table) <- c("min","median","max") rownames(statistics_table) <- c("gametime_local","Difference","Stadium_Capacity") 
+statistics_table 
+## Almost 50% of games begin around 1pm at local time. Difference between home_score and away_score is big.  
+ 
+# day_of_wk table(arrest$day_of_wk) ## More games are at Sunday 
+ 
+ 
+# Winner_game table(arrest$Winner_game,arrest$Arrests) plot(arrest$Winner_game, arrest$Arrests) ##More arrests when game is tied 
+ 
+ 
+# Narrow_loss table(arrest$Narrow_loss,arrest$Arrests) plot(arrest$Narrow_loss, arrest$Arrests) ## No much differences 
+ 
+# OT 
+plot(arrest$OT, arrest$Arrests) ## No much differences 
+ 
+# division_gm plot(arrest$division_gm, arrest$Arrests) table(arrest$division_gm) ## A little bit more arrests when the game is a division game 
+ 
+ 
+#correlation 
+corr<-cor(arrest %>% dplyr::select("week_num", "gametime_local", "home_score", "away_score", "Difference","Stadium_Capacity"))
+t_corr<-as.data.frame(as.table(corr)) 
+subset(t_corr,abs(Freq)>0.5 & abs(Freq)!=1) 
+## highly correlated between difference and home_score, difference and away_score. Two of them can explain the other. So manually drop away_score.  
+``` 
+ 
+ 
+```{r model building} 
+# 75% of data as a train set and 25% of data as a test set 
+amt <- floor((0.75) * nrow(arrest)) set.seed(500) 
+train_index <- sample(seq_len(nrow(arrest)), size = amt) 
+arrest_train <- arrest[train_index, ] 
+arrest_test <- arrest[-train_index, ] 
+ 
+# Full model without away_score since colinearity 
+fit0 <- glm(Arrests~.-away_score, data = arrest_train, family = "binomial") 
+ 
+# OLS with AIC method  
+fit1.1<-stepAIC(fit0, direction = "both",trace=F) 
+fit1.2<-stepAIC(fit0, direction = "forward",trace=F) 
+AIC(fit1.1,fit1.2)
+
+##Use "both" AIC 
+anova(fit0,fit1.1,test = "Chisq") 
+summary(fit1.1)
+## AIC method selects season, week_num, gametime_local and home_team  
+ 
+ 
+# Ridge with 10 CV 
+X <- model.matrix(Arrests ~.-1-away_score, data = arrest_train) 
+set.seed(500) 
+fit.ridge <- cv.glmnet(X, arrest_train$Arrests,family = "binomial", alpha = 0, nfolds = 10) fit.ridge$lambda.min 
+plot(fit.ridge, xvar = "lambda",  label=TRUE) 
+abline(v=log(0.0956), col = "red" ) 
+fit.ridge$lambda.min 
+ 
+# Lasso with 10 CV 
+set.seed(500) 
+fit.lasso <- cv.glmnet(X, arrest_train$Arrests,family = "binomial", alpha = 1, nfolds = 10) 
+plot(fit.lasso, label=TRUE) 
+abline(v=log(0.016), col = "red" ) 
+coef(fit.lasso) 
+## Lasso model selects season, week_num, gametime_local, home_team, away_team, home_score, and Stadium_Capacity 
+ 
+ 
+# DT with 10 CV 
+set.seed(500) 
+tree_parameters = tree.control(nobs=nrow(arrest_train), minsize=10, mindev=1e-3)
+set.seed(500) 
+tree.model <- tree(arrest_train$Arrests ~ ., data = arrest_train, control = tree_parameters) 
+cv <- cv.tree(tree.model, FUN = prune.misclass, K = 10) 
+tree.selection = which(cv$dev == min(cv$dev)) 
+best_size = min(cv$size[tree.selection]) 
+best_size 
+ 
+prunned.tree <- prune.tree(tree.model, best = best_size) 
+draw.tree(prunned.tree, nodeinfo=TRUE,cex=.5) 
+ 
+ 
+# RF with 10 CV 
+mtry_n <- sqrt(14) 
+set.seed(500) 
+rand.forest <- randomForest(Arrests ~ ., data = arrest_train, mtry = mtry_n,importance = T) 
+varImpPlot(rand.forest, sort = T, main = "Variable Importance for rf.carseats", n.var=5)
+## random forest selects home_team, gametime_local, Stadium_Capacity, Winner_game, and Difference in terms of Mean Decrease Accuracy ## random forest selects home_team, gametime_local,Stadium_Capacity, away_team, and home score in terms of Mean Decrease Gini 
+ 
+# Bagging 
+bagging <- randomForest(Arrests ~ ., data = arrest_train, importance = T) 
+varImpPlot(bagging, sort = T, main = "Variable Importance for rf.carseats", n.var=5) 
+ 
+# Boosting with 1000 tree 
+set.seed(500) 
+fit.boost <- gbm(Arrests~.-away_score, data=arrest_train, distribution="bernoulli",shrinkage = 0.01, n.trees=1000) 
+summary(fit.boost) 
+``` 
+ 
+```{r model_comparison} 
+# Model comparisons by ROC curve 
+ 
+## OLS 
+pro.test.OLS <- round(predict(fit1.1, arrest_test, type="response"), digits=3) 
+pre.OLS <- prediction(pro.test.OLS, arrest_test$Arrests) 
+perf.OLS <- performance(pre.OLS,measure = "tpr", x.measure = "fpr") 
+auc.OLS <- performance(pre.OLS,"auc")@y.values[[1]] 
+ 
+## Ridge  
+X.test <- model.matrix(Arrests ~.-1-away_score, data = arrest_test) 
+pro.test.ridge <- round(predict(fit.ridge, X.test, type="response"), digits=3) 
+pre.ridge <- prediction(pro.test.ridge, arrest_test$Arrests)
+fpr_ridge <- performance(pre.ridge,"fpr")@y.values[[1]]
+tpr_ridge <- performance(pre.ridge,"tpr")@y.values[[1]] 
+auc.ridge <- performance(pre.ridge,"auc")@y.values[[1]] 
+ 
+ 
+## Lasso 
+pro.test.lasso <- round(predict(fit.lasso, X.test, type="response"), digits=3) 
+pre.lasso <- prediction (pro.test.lasso, arrest_test$Arrests)
+fpr_lasso <- performance(pre.lasso,"fpr")@y.values[[1]] 
+tpr_lasso <- performance(pre.lasso,"tpr")@y.values[[1]] 
+auc.lasso <- performance(pre.lasso,"auc")@y.values[[1]] 
+ 
+ 
+## Decision Tree 
+pred.vector.dt <- predict(prunned.tree, arrest_test, type = "vector") 
+pred.dt <- prediction(pred.vector.dt[,2], arrest_test$Arrests)
+fpr_dt <- performance(pred.dt,"fpr")@y.values[[1]] 
+tpr_dt <- performance(pred.dt,"tpr")@y.values[[1]] 
+auc.dt <- performance(pred.dt,"auc")@y.values[[1]] 
+ 
+ 
+# Bagging 
+pro.bagging <- predict(bagging, arrest_test, type = "prob") 
+pred.bagging <- prediction(pro.bagging[,2], arrest_test$Arrests)
+fpr_bagging <- performance(pred.bagging,"fpr")@y.values[[1]]
+tpr_bagging <- performance(pred.bagging,"tpr")@y.values[[1]] 
+auc.bagging <- performance(pred.bagging,"auc")@y.values[[1]] 
+ 
+ 
+## Random Forest  
+pro.rf <- predict(rand.forest, arrest_test, type = "prob") 
+pred.rf <- prediction(pro.rf[,2], arrest_test$Arrests) 
+fpr_rf <- performance(pred.rf,"fpr")@y.values[[1]] 
+tpr_rf <- performance(pred.rf,"tpr")@y.values[[1]] 
+auc.rf <- performance(pred.rf,"auc")@y.values[[1]] 
+ 
+ 
+ 
+##Boosting 
+pro.boost = predict(fit.boost, newdata = arrest_test, type="response", n.trees=500) 
+
+# ROC Curve
+plot(perf.OLS, col = 2, lwd = 3, main = "ROC Curve") 
+lines(fpr_ridge,tpr_ridge, col = 1, lwd =2) 
+lines(fpr_lasso,tpr_lasso, col = 3, lwd =2) 
+lines(fpr_dt,tpr_dt, col =4, lwd =2) 
+lines(fpr_rf,tpr_rf, col =5, lwd =2) 
+lines(fpr_bagging,tpr_bagging, col =6, lwd =2) 
+ 
+legend(.55,.4, c("OLS","Ridge","Lasso","Decision Tree","Random Forest","Bagging"),         lty=c(1,1,1,1,1,1),lwd=c(2,2,2,2,2,2),col=c("2","1","3","4","5","6"), cex = .3) 
+ 
+ 
+# AUC Table 
+auc_table <- round(matrix(c(auc.OLS,auc.ridge, auc.lasso, auc.dt, auc.rf,auc.bagging), ncol = 6),digit = 3)
+auc_table <- as.data.frame(auc_table) 
+colnames(auc_table) <- c( "OLS with AIC", "Ridge", "Lasso", "Decision Tree", "Random Forest","Bagging")
+rownames(auc_table) <- "AUC" auc_table 
+ 
+# Ridge Regression has the largest AUC score 
+``` 
+ 
+ 
+```{r confusion_matrix} 
+# Calculate the error rates to measure and compare classification performance. 
+records = matrix(NA, nrow=6, ncol=4)  
+colnames(records) <- c("train.error","test.error","train.FNR","test.FNR")  
+rownames(records) <- c("OLS with AIC","Ridge","Lasso","Decision Tree","Random Forest","Bagging") 
+ 
+# Calculate misclassification error rate.  
+calc_error_rate <- function(predicted.value, true.value)   
+  { return(mean(true.value!=predicted.value)) } 
+ 
+# Calculate FNR 
+calc_FNR <- function(predicted.value, true.value)   
+  { t <- table(predicted.value, true.value)     return (t[3]/sum(t[1,])) } 
+ 
+ 
+## OLS with AIC  
+# Use the majority rule .. If the probability is larger than 50% class as arrest. 
+prob.training.OLS <- predict (fit1.1, type="response") 
+prob.train.OLS <- as.factor(ifelse(prob.training.OLS<= 0.5,0,1)) 
+ 
+prob.test.OLS <- as.factor(ifelse(pro.test.OLS <= 0.5,0,1)) 
+ 
+records[1,] <- c(calc_error_rate(prob.train.OLS,arrest_train$Arrests), calc_error_rate(prob.test.OLS, arrest_test$Arrests), calc_FNR(prob.train.OLS,arrest_train$Arrests), calc_FNR(prob.test.OLS, arrest_test$Arrests)) 
+ 
+## Ridge  
+X.train <- model.matrix(Arrests ~.-1-away_score, data = arrest_train) 
+pro.training.ridge <- predict(fit.ridge, X.train, type="response") 
+prob.train.ridge <- as.factor(ifelse(pro.training.ridge<= 0.5,0,1)) 
+ 
+ 
+prob.test.ridge <- as.factor(ifelse(pro.test.ridge <= 0.5,0,1)) 
+ 
+records[2,] <- c(calc_error_rate(prob.train.ridge,arrest_train$Arrests), calc_error_rate(pro.test.ridge, arrest_test$Arrests), calc_FNR(prob.train.ridge,arrest_train$Arrests), calc_FNR(pro.test.ridge, arrest_test$Arrests)) 
+ 
+ 
+## LASSO 
+pro.training.lasso <- predict(fit.lasso, X.train, type="response") 
+prob.train.lasso <- as.factor(ifelse(pro.training.lasso<= 0.5,0,1)) 
+ 
+prob.test.lasso <- as.factor(ifelse(pro.test.lasso <= 0.5,0,1)) 
+ 
+records[3,] <- c(calc_error_rate(prob.train.lasso,arrest_train$Arrests), calc_error_rate(prob.test.lasso, arrest_test$Arrests), calc_FNR(prob.train.lasso,arrest_train$Arrests), calc_FNR(prob.test.lasso, arrest_test$Arrests)) 
+ 
+ 
+## Decision Tree 
+pred.train.dt <- predict(prunned.tree, arrest_train, type = "class") 
+pred.test.dt <- predict(prunned.tree, arrest_test, type = "class") 
+ 
+records[4,] <- c(calc_error_rate(pred.train.dt,arrest_train$Arrests), calc_error_rate(pred.test.dt,arrest_test$Arrests), calc_FNR(pred.train.dt,arrest_train$Arrests), calc_FNR(pred.test.dt,arrest_test$Arrests)) 
+ 
+## Random Forest 
+pred.train.rf <- predict (rand.forest, arrest_train) 
+pred.test.rf <- predict (rand.forest, arrest_test) 
+ 
+records[5,] <- c(calc_error_rate(pred.train.rf,arrest_train$Arrests), calc_error_rate(pred.test.rf,arrest_test$Arrests), calc_FNR(pred.train.rf,arrest_train$Arrests), calc_FNR(pred.test.rf,arrest_test$Arrests)) 
+ 
+## Bagging 
+pred.train.bg<- predict(bagging, arrest_train) 
+pred.test.bg <- predict(bagging, arrest_test) 
+ 
+records[6,] <- c(calc_error_rate(pred.train.bg,arrest_train$Arrests), calc_error_rate(pred.test.bg,arrest_test$Arrests), calc_FNR(pred.train.bg,arrest_train$Arrests), calc_FNR(pred.test.bg,arrest_test$Arrests)) 
+ 
+ 
+## Threshold 
+# Threshold Function 
+tlab = arrest_train$Arrests rate = NULL 
+all = seq(0.0002,0.99999,0.01) 
+best.th <- function (prob.training) 
+{ for (i in all)   
+{    temp = as.factor(ifelse(prob.training<=i, "No", "Yes"))    
+    error = table(temp, tlab)    
+# calculate FPR and FNR   
+fpfn = cbind(threshold=i,FP=error[2]/(error[1]+error[2]),FN=error[3]/(error[3]+error[4]))    
+rate = as.data.frame(rbind(rate,fpfn)) 
+
+# save the values }     
+# calculate the euclidean distance between (FPR,FNR) and (0,0)   
+rate$distance = sqrt((rate[,2])^2+(rate[,3])^2)   
+# select the probability threshold with the smallest euclidean distance   
+index = which.min(rate$distance)   
+  {rate$threshold[index]   } 
+ 
+# OLS best.th.OLS<-best.th(prob.training.OLS) 
+ 
+records.best.threshold <- records  
+ 
+prob.train.OLS.th <- as.factor(ifelse(prob.training.OLS<= best.th.OLS,0,1)) 
+prob.test.OLS.th <- as.factor(ifelse(pro.test.OLS <=best.th.OLS,0,1)) 
+records.best.threshold[1,] <- c( calc_error_rate(prob.train.OLS.th,arrest_train$Arrests) , calc_error_rate(prob.test.OLS.th, arrest_test$Arrests), calc_FNR(prob.train.OLS.th,arrest_train$Arrests) , calc_FNR(prob.test.OLS.th, arrest_test$Arrests)) 
+ 
+# Ridge 
+best.th.ridge <- best.th(pro.training.ridge) 
+best.th.ridge 
+prob.train.ridge.th <- as.factor(ifelse(pro.training.ridge<= best.th.ridge,0,1))
+prob.test.ridge.th <- as.factor(ifelse(pro.test.ridge <=best.th.ridge,0,1)) 
+records.best.threshold[2,] <- c( calc_error_rate(prob.train.ridge.th,arrest_train$Arrests) , calc_error_rate(prob.test.ridge.th, arrest_test$Arrests), calc_FNR(prob.train.ridge.th,arrest_train$Arrests) , calc_FNR(prob.test.ridge.th, arrest_test$Arrests)) 
+ 
+ 
+# Lasso 
+best.th.lasso<-best.th(pro.training.lasso) 
+best.th.lasso 
+prob.train.lasso.th <- as.factor(ifelse(pro.training.lasso<= best.th.lasso,0,1))
+prob.test.lasso.th <- as.factor(ifelse(pro.test.lasso <=best.th.lasso,0,1)) 
+records.best.threshold[3,] <- c( calc_error_rate(prob.train.lasso.th,arrest_train$Arrests) , calc_error_rate(prob.test.lasso.th, arrest_test$Arrests),calc_FNR(prob.train.lasso.th,arrest_train$Arrests) , calc_FNR(prob.test.lasso.th, arrest_test$Arrests)) 
+ 
+round(records,digits = 3) 
+ 
+round(records.best.threshold,digits = 3) 
+ 
+# The result of lasso regression 
+coef(fit.lasso) 
+``` 
